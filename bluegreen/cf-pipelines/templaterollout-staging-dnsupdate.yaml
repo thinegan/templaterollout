@@ -1,0 +1,134 @@
+# More examples of Codefresh YAML can be found at
+# https://codefresh.io/docs/docs/yaml-examples/examples/
+
+version: '1.0'
+stages:
+  - prepare/builds
+  - security scans
+  - push/updates
+  - release
+
+steps:
+
+  PreSetupVariables:
+    stage: prepare/builds
+    title: Setup domain to be updated
+    image: anthonyzou/alpine-build-essentials:latest
+    commands:
+      - cf_export CDF_DOMAIN=crytera.com
+      # Cloudflare, only 1 dns record needed to make the switchover (dns will automatically update).
+      - cf_export CDF_DOMAIN_RECORD_PRE=cname-stag-templatebluegreen.crytera.com
+      - cf_export CDF_DOMAIN_RECORD=stag-templatebluegreen.crytera.com
+      - cf_export CDF_DOMAIN_RECORD_PRE_PREVIEW=cname-stag-templatebluegreen-preview.crytera.com
+      - cf_export CDF_DOMAIN_RECORD_PREVIEW=stag-templatebluegreen-preview.crytera.com
+      - cf_export CDF_DOMAIN_RECORD_TYPE=TXT
+      # Migrate APPS External DNS from existing to new cluster
+      - cf_export CDF_CONTENT_SEARCH=stag-eks-test4   # Old Cluster
+      - cf_export CDF_CONTENT_REPLACE=stag-eks-test6  # New Cluster
+
+  FetchSecrets:
+    stage: prepare/builds
+    title: Fetch secrets from AWS Secrets Manager
+    type: aws-secrets-manager
+    arguments:
+      AWS_ACCESS_KEY_ID: '${{AWS_ACCESS_KEY_ID}}'
+      AWS_SECRET_ACCESS_KEY: '${{AWS_SECRET_ACCESS_KEY}}'
+      AWS_DEFAULT_REGION: '${{AWS_DEFAULT_REGION}}'
+      secrets:
+        - secret_arn: '${{CLOUDFLARE_STAG_SECRET_ARN}}'
+          key: CLOUDFLARE_API_TOKEN
+          store_in: CLOUDFLARE_API_TOKEN
+
+  CloudflareGetData:
+      stage: prepare/builds
+      title: "Cloudflare Get initial Info"
+      image: wbitt/network-multitool
+      commands:
+        - |
+          # Export Cloudflare ZoneID
+          cf_export CDF_ZONE_ID=$(curl "https://api.cloudflare.com/client/v4/zones?name="${{CDF_DOMAIN}}"&status=active" \
+          -H "Authorization: Bearer ${{CLOUDFLARE_API_TOKEN}}" | jq -r '.result[0].id')
+
+          # Get Cloudflare ZoneID
+          ZONE_ID=$(curl "https://api.cloudflare.com/client/v4/zones?name="${{CDF_DOMAIN}}"&status=active" \
+          -H "Authorization: Bearer ${{CLOUDFLARE_API_TOKEN}}" | jq -r '.result[0].id')
+
+          # Export Cloudflare Domain Record ID - PRESetup
+          cf_export CDF_PRE_RECORD_ID=$(curl "https://api.cloudflare.com/client/v4/zones/"$ZONE_ID"/dns_records?name=${{CDF_DOMAIN_RECORD_PRE}}&type=${{CDF_DOMAIN_RECORD_TYPE}}" \
+          -H "Authorization: Bearer ${{CLOUDFLARE_API_TOKEN}}" | jq -r '.result[0].id')
+
+          # Export Cloudflare Domain Record ID
+          cf_export CDF_RECORD_ID=$(curl "https://api.cloudflare.com/client/v4/zones/"$ZONE_ID"/dns_records?name=${{CDF_DOMAIN_RECORD}}&type=${{CDF_DOMAIN_RECORD_TYPE}}" \
+          -H "Authorization: Bearer ${{CLOUDFLARE_API_TOKEN}}" | jq -r '.result[0].id')
+
+          # Export Cloudflare Domain Record ID Preview - PRESetup
+          cf_export CDF_PRE_RECORD_ID_PREVIEW=$(curl "https://api.cloudflare.com/client/v4/zones/"$ZONE_ID"/dns_records?name=${{CDF_DOMAIN_RECORD_PRE_PREVIEW}}&type=${{CDF_DOMAIN_RECORD_TYPE}}" \
+          -H "Authorization: Bearer ${{CLOUDFLARE_API_TOKEN}}" | jq -r '.result[0].id')
+
+          # Export Cloudflare Domain Record ID Preview
+          cf_export CDF_RECORD_ID_PREVIEW=$(curl "https://api.cloudflare.com/client/v4/zones/"$ZONE_ID"/dns_records?name=${{CDF_DOMAIN_RECORD_PREVIEW}}&type=${{CDF_DOMAIN_RECORD_TYPE}}" \
+          -H "Authorization: Bearer ${{CLOUDFLARE_API_TOKEN}}" | jq -r '.result[0].id')
+
+          # Write Cloudflare Domain Content to a file.yaml
+          curl "https://api.cloudflare.com/client/v4/zones/"$ZONE_ID"/dns_records?name=${{CDF_DOMAIN_RECORD}}&type=${{CDF_DOMAIN_RECORD_TYPE}}" \
+          -H "Authorization: Bearer ${{CLOUDFLARE_API_TOKEN}}" | jq -r '.result[0].content' > cdf_content.yaml
+
+          # Write Cloudflare Domain Content Preview to a file.yaml
+          curl "https://api.cloudflare.com/client/v4/zones/"$ZONE_ID"/dns_records?name=${{CDF_DOMAIN_RECORD_PREVIEW}}&type=${{CDF_DOMAIN_RECORD_TYPE}}" \
+          -H "Authorization: Bearer ${{CLOUDFLARE_API_TOKEN}}" | jq -r '.result[0].content' > cdf_preview_content.yaml
+
+
+  CloudflareUpdateData:
+    stage: push/updates
+    title: "Cloudflare Update Data"
+    image: "mikefarah/yq:latest"
+    commands:
+      - cat cdf_content.yaml
+      - yq eval '. |= sub("external-dns/owner=${{CDF_CONTENT_SEARCH}}", "external-dns/owner=${{CDF_CONTENT_REPLACE}}")' cdf_content.yaml
+      - yq -i '. |= sub("external-dns/owner=${{CDF_CONTENT_SEARCH}}", "external-dns/owner=${{CDF_CONTENT_REPLACE}}")' cdf_content.yaml
+      - cat cdf_content.yaml
+      - cf_export CDF_CONTENT=$(cat "cdf_content.yaml")
+      - cat cdf_preview_content.yaml
+      - yq eval '. |= sub("external-dns/owner=${{CDF_CONTENT_SEARCH}}", "external-dns/owner=${{CDF_CONTENT_REPLACE}}")' cdf_preview_content.yaml
+      - yq -i '. |= sub("external-dns/owner=${{CDF_CONTENT_SEARCH}}", "external-dns/owner=${{CDF_CONTENT_REPLACE}}")' cdf_preview_content.yaml
+      - cat cdf_preview_content.yaml
+      - cf_export CDF_CONTENT_PREVIEW=$(cat "cdf_preview_content.yaml")
+      
+
+  CloudflarePutData:
+      stage: push/updates
+      title: "Cloudflare Push Update Record"
+      image: wbitt/network-multitool
+      commands:
+        - |
+          curl --request PUT \
+            --url https://api.cloudflare.com/client/v4/zones/${{CDF_ZONE_ID}}/dns_records/${{CDF_RECORD_ID}} \
+            --header "Authorization: Bearer ${{CLOUDFLARE_API_TOKEN}}" \
+            --data '{
+            "content": "${{CDF_CONTENT}}",
+            "name": "${{CDF_DOMAIN_RECORD}}",
+            "type": "${{CDF_DOMAIN_RECORD_TYPE}}"
+          }'
+          curl --request PUT \
+            --url https://api.cloudflare.com/client/v4/zones/${{CDF_ZONE_ID}}/dns_records/${{CDF_RECORD_ID_PREVIEW}} \
+            --header "Authorization: Bearer ${{CLOUDFLARE_API_TOKEN}}" \
+            --data '{
+            "content": "${{CDF_CONTENT_PREVIEW}}",
+            "name": "${{CDF_DOMAIN_RECORD_PREVIEW}}",
+            "type": "${{CDF_DOMAIN_RECORD_TYPE}}"
+          }'
+
+  CloudflareDeleteData:
+      stage: push/updates
+      title: "Cloudflare Delete Old Record"
+      image: wbitt/network-multitool
+      commands:
+        - |
+          curl --request DELETE \
+            --url https://api.cloudflare.com/client/v4/zones/${{CDF_ZONE_ID}}/dns_records/${{CDF_PRE_RECORD_ID}} \
+            --header "Authorization: Bearer ${{CLOUDFLARE_API_TOKEN}}"
+          curl --request DELETE \
+            --url https://api.cloudflare.com/client/v4/zones/${{CDF_ZONE_ID}}/dns_records/${{CDF_PRE_RECORD_ID_PREVIEW}} \
+            --header "Authorization: Bearer ${{CLOUDFLARE_API_TOKEN}}"
+
+# debug mode 25

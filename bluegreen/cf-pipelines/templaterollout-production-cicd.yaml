@@ -1,0 +1,258 @@
+# More examples of Codefresh YAML can be found at
+# https://codefresh.io/docs/docs/yaml-examples/examples/
+
+version: "1.0"
+stages:
+  - prepare/builds
+  - security scans
+  - manifest push
+  - release
+
+steps:
+  clone:
+    stage: prepare/builds
+    title: "Cloning repository"
+    type: "git-clone"
+    repo: "thinegan/templaterollout"
+    revision: "${{CF_BRANCH}}"
+    depth: 1
+    git: "githubcodefresh12"
+
+  ReleaseVariables:
+    stage: prepare/builds
+    image: anthonyzou/alpine-build-essentials:latest
+    working_directory: "${{clone}}/bluegreen/infra/charts"
+    commands:
+      - cf_export RELEASE_IMAGE_TAG="${{CF_SHORT_REVISION}}"
+      - cf_export RELEASE_VERSION="${{CF_SHORT_REVISION}}"
+      - cf_export ECR_IMAGE_REPO=thinegan/templaterollout
+      - cf_export HELM_NAMESPACE=bluegreen
+      - cf_export KUBE_CONTEXT=stag-eks-test6
+      - cf_export KUBE_CONTEXT_PROD=general6
+      - cf_export APP_NAME=templatebluegreen
+      - cf_export APP_REPO="https://github.com/thinegan/templaterollout.git"
+      - cf_export APP_PROJECT="product"
+      - cf_export APP_DOMAINCERT="*.crytera.com"
+      - cf_export ASSUMEROLE_PROFILE=production1
+      - cf_export ASSUMEROLE="${{AWS_PROD_ASSUMEROLE}}"
+
+  GetCloudInfo:
+    stage: prepare/builds
+    image: zenika/terraform-aws-cli:latest
+    title: Get Stag ELB sgid, endpoint
+    commands:
+      - aws configure set aws_access_key_id ${{AWS_ACCESS_KEY_ID}}
+      - aws configure set aws_secret_access_key ${{AWS_SECRET_ACCESS_KEY}}
+      - aws configure set region ${{AWS_DEFAULT_REGION}}
+      - cf_export AWS_ACC=$(aws sts get-caller-identity | jq -r '.Account')
+      - cf_export INGRESS_ELB_SG=$(aws ec2 describe-security-groups --filters Name=group-name,Values='${{KUBE_CONTEXT}}-elb-web-traffic' | jq -r '.SecurityGroups[0].GroupId')
+      - cf_export KUBE_ENDPOINT=$(aws eks describe-cluster --name ${{KUBE_CONTEXT}} | jq -r '.cluster.endpoint')
+      - cf_export CERT_ACM=$(aws acm list-certificates --query "CertificateSummaryList[?DomainName=='${{APP_DOMAINCERT}}'].CertificateArn" --certificate-statuses "ISSUED" --output text)
+
+  GetProdCloudInfo:
+    stage: prepare/builds
+    image: zenika/terraform-aws-cli:latest
+    title: Get Prod ELB sgid, endpoint
+    commands:
+      - aws configure set aws_access_key_id ${{AWS_ACCESS_KEY_ID}} --profile ${{ASSUMEROLE_PROFILE}}
+      - aws configure set aws_secret_access_key ${{AWS_SECRET_ACCESS_KEY}} --profile ${{ASSUMEROLE_PROFILE}}
+      - aws configure set region ${{AWS_DEFAULT_REGION}} --profile ${{ASSUMEROLE_PROFILE}}
+      - aws configure set role_arn ${{ASSUMEROLE}} --profile ${{ASSUMEROLE_PROFILE}}
+      - aws configure set source_profile ${{ASSUMEROLE_PROFILE}} --profile ${{ASSUMEROLE_PROFILE}}
+      - aws configure set role_session_name session_${{ASSUMEROLE_PROFILE}} --profile ${{ASSUMEROLE_PROFILE}}
+      - aws configure set region ${{AWS_DEFAULT_REGION}} --profile ${{ASSUMEROLE_PROFILE}}
+      - aws configure set output text --profile ${{ASSUMEROLE_PROFILE}}
+      - cf_export INGRESS_ELB_SG_PROD=$(aws ec2 describe-security-groups --filters Name=group-name,Values='${{KUBE_CONTEXT_PROD}}-elb-web-traffic' --profile ${{ASSUMEROLE_PROFILE}} --query "SecurityGroups[0].GroupId" --output text)
+      - cf_export KUBE_ENDPOINT_PROD=$(aws eks describe-cluster --name ${{KUBE_CONTEXT_PROD}} --profile ${{ASSUMEROLE_PROFILE}} --query "cluster.endpoint" --output text)
+      - cf_export CERT_ACM_PROD=$(aws acm list-certificates --query "CertificateSummaryList[?DomainName=='${{APP_DOMAINCERT}}'].CertificateArn" --certificate-statuses "ISSUED" --output text)
+      - cf_export FQD_ECR="${{AWS_ACC}}.dkr.ecr.us-east-1.amazonaws.com/${{ECR_IMAGE_REPO}}"
+
+  build_app_image:
+    stage: prepare/builds
+    title: Building Docker Image
+    type: build
+    image_name: ${{ECR_IMAGE_REPO}}
+    working_directory: "${{clone}}/bluegreen/docker/${{APP_NAME}}"
+    tag: '${{RELEASE_IMAGE_TAG}}'
+    dockerfile: Dockerfile
+
+  FetchSnykSecrets:
+    stage: security scans
+    title: Fetch secrets from AWS Secrets Manager
+    type: aws-secrets-manager:1.0.1
+    arguments:
+      AWS_ACCESS_KEY_ID: '${{AWS_ACCESS_KEY_ID}}'
+      AWS_SECRET_ACCESS_KEY: '${{AWS_SECRET_ACCESS_KEY}}'
+      AWS_DEFAULT_REGION: '${{AWS_DEFAULT_REGION}}'
+      secrets:
+        - secret_arn: '${{SNYK_STAG_SECRET_ARN}}'
+          key: SNYK_ORG_NAME
+          store_in: SNYK_ORG_NAME
+        - secret_arn: '${{SNYK_STAG_SECRET_ARN}}'
+          key: SNYK_AUTH_TOKEN
+          store_in: SNYK_AUTH_TOKEN
+
+  MySnykContainer:
+    stage: security scans
+    title: Snyk Container Vulnerable Check
+    image: snyk/snyk:docker
+    working_directory: "${{clone}}/bluegreen/docker/${{APP_NAME}}"
+    fail_fast: false
+    environment:
+      - SNYK_TOKEN=${{SNYK_AUTH_TOKEN}}
+      - SNYK_ORG=${{SNYK_ORG_NAME}}
+      - SNYK_API_ENDPOINT="https://snyk.io/"
+    commands:
+      - snyk auth $SNYK_TOKEN
+      - apk add --no-cache aws-cli
+      - aws configure set aws_access_key_id ${{AWS_ACCESS_KEY_ID}}
+      - aws configure set aws_secret_access_key ${{AWS_SECRET_ACCESS_KEY}}
+      - aws configure set region ${{AWS_DEFAULT_REGION}}
+      - aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${{AWS_ACC}}.dkr.ecr.us-east-1.amazonaws.com
+      - snyk container monitor --project-name=${{ECR_IMAGE_REPO}} --severity-threshold=high --file=Dockerfile ${{AWS_ACC}}.dkr.ecr.us-east-1.amazonaws.com/${{ECR_IMAGE_REPO}}:${{RELEASE_IMAGE_TAG}}  --exclude-app-vulns
+      - snyk container test --severity-threshold=high --file=Dockerfile ${{AWS_ACC}}.dkr.ecr.us-east-1.amazonaws.com/${{ECR_IMAGE_REPO}}:${{RELEASE_IMAGE_TAG}}  --exclude-app-vulns
+    on_success:
+      metadata:
+        set:
+          - '${{build_app_image.imageId}}':
+            - CF_QUALITY: true
+    on_fail:
+      metadata:
+        set:
+          - '${{build_app_image.imageId}}':
+            - CF_QUALITY: false
+
+  clone_gitops:
+    stage: manifest push
+    title: cloning gitops repo
+    type: git-clone
+    git: "githubcodefresh12"
+    arguments:
+      repo: 'thinegan/codefresh-gitops'
+      revision: 'master'
+    when:
+      branch:
+        only:
+          - master 
+
+  change_manifest:
+    stage: manifest push
+    title: "Update staging manifest"
+    image: "mikefarah/yq:latest"
+    working_directory: "${{clone_gitops}}"
+    commands:
+      - mkdir -p ${{APP_NAME}}
+      - cp -f app-template/application_rollout_bluegreen.yaml ${{APP_NAME}}/application.yaml
+      - NAME="${{APP_NAME}}" yq e -i '.metadata.name = strenv(NAME)' ${{APP_NAME}}/application.yaml
+      - NAME="${{APP_NAME}}" yq e -i '.metadata.labels.name = strenv(NAME)' ${{APP_NAME}}/application.yaml
+      - PROJECT="${{APP_PROJECT}}" yq e -i '.spec.project = strenv(PROJECT)' ${{APP_NAME}}/application.yaml
+      - REPO="${{APP_REPO}}" yq e -i '.spec.source.repoURL = strenv(REPO)' ${{APP_NAME}}/application.yaml
+      - LOC="./bluegreen/infra/charts/${{APP_NAME}}" yq e -i '.spec.source.path = strenv(LOC)' ${{APP_NAME}}/application.yaml
+      - TAG="${{RELEASE_IMAGE_TAG}}" yq e -i '.spec.source.helm.parameters[0].value = strenv(TAG)' ${{APP_NAME}}/application.yaml
+      - ELB="${{INGRESS_ELB_SG}}" yq e -i '.spec.source.helm.parameters[1].value = strenv(ELB)' ${{APP_NAME}}/application.yaml
+      - ELB="${{INGRESS_ELB_SG}}" yq e -i '.spec.source.helm.parameters[2].value = strenv(ELB)' ${{APP_NAME}}/application.yaml
+      - ACM="${{CERT_ACM}}" yq e -i '.spec.source.helm.parameters[3].value = strenv(ACM)' ${{APP_NAME}}/application.yaml
+      - ECR="${{FQD_ECR}}" yq e -i '.spec.source.helm.parameters[4].value = strenv(ECR)' ${{APP_NAME}}/application.yaml
+      - ENP="${{KUBE_ENDPOINT}}" yq e -i '.spec.destination.server = strenv(ENP)' ${{APP_NAME}}/application.yaml
+      - NS="${{HELM_NAMESPACE}}" yq e -i '.spec.destination.namespace = strenv(NS)' ${{APP_NAME}}/application.yaml
+      - cat ${{APP_NAME}}/application.yaml
+    when:
+      branch:
+        only:
+          - master
+
+  change_prod_manifest:
+    stage: manifest push
+    title: "Update production manifest"
+    image: "mikefarah/yq:latest"
+    working_directory: "${{clone_gitops}}"
+    commands:
+      - mkdir -p ${{APP_NAME}}
+      - cp -f app-template/application_rollout_bluegreen_prod.yaml ${{APP_NAME}}/application_prod.yaml
+      - NAME="${{APP_NAME}}" yq e -i '.metadata.name = strenv(NAME)' ${{APP_NAME}}/application_prod.yaml
+      - NAME="${{APP_NAME}}" yq e -i '.metadata.labels.name = strenv(NAME)' ${{APP_NAME}}/application_prod.yaml
+      - PROJECT="${{APP_PROJECT}}" yq e -i '.spec.project = strenv(PROJECT)' ${{APP_NAME}}/application_prod.yaml
+      - REPO="${{APP_REPO}}" yq e -i '.spec.source.repoURL = strenv(REPO)' ${{APP_NAME}}/application_prod.yaml
+      - LOC="./bluegreen/infra/charts/${{APP_NAME}}" yq e -i '.spec.source.path = strenv(LOC)' ${{APP_NAME}}/application_prod.yaml
+      - TAG="${{RELEASE_IMAGE_TAG}}" yq e -i '.spec.source.helm.parameters[0].value = strenv(TAG)' ${{APP_NAME}}/application_prod.yaml
+      - ELB="${{INGRESS_ELB_SG}}" yq e -i '.spec.source.helm.parameters[1].value = strenv(ELB)' ${{APP_NAME}}/application_prod.yaml
+      - ELB="${{INGRESS_ELB_SG}}" yq e -i '.spec.source.helm.parameters[2].value = strenv(ELB)' ${{APP_NAME}}/application_prod.yaml
+      - ACM="${{CERT_ACM_PROD}}" yq e -i '.spec.source.helm.parameters[3].value = strenv(ACM)' ${{APP_NAME}}/application_prod.yaml
+      - ECR="${{FQD_ECR}}" yq e -i '.spec.source.helm.parameters[4].value = strenv(ECR)' ${{APP_NAME}}/application_prod.yaml
+      - ENP="${{KUBE_ENDPOINT}}" yq e -i '.spec.destination.server = strenv(ENP)' ${{APP_NAME}}/application_prod.yaml
+      - NS="${{HELM_NAMESPACE}}" yq e -i '.spec.destination.namespace = strenv(NS)' ${{APP_NAME}}/application_prod.yaml
+      - cat ${{APP_NAME}}/application_prod.yaml
+    when:
+      branch:
+        only:
+          - master
+
+  commit_and_push:
+    stage: manifest push
+    title: Commit manifest
+    type: git-commit:0.1.3
+    arguments:
+      repo: 'thinegan/codefresh-gitops'
+      git: "githubcodefresh12"
+      working_directory: '/codefresh/volume/codefresh-gitops'
+      commit_message: "Updated manifest for ${{RELEASE_IMAGE_TAG}}"
+      git_user_name: ${{GITHUBOT_USERNAME}}
+      git_user_email: ${{GITHUBOT_EMAIL}}
+      allow_empty: false
+      add:
+        - ${{APP_NAME}}/application.yaml
+        - ${{APP_NAME}}/application_prod.yaml
+    when:
+      branch:
+        only:
+          - master
+
+  ValidateHelmChart:
+    stage: release
+    title: "Validate helm chart"
+    image: codefresh/cfstep-helm
+    working_directory: "${{clone}}/bluegreen/infra/charts/${{APP_NAME}}"
+    commands:
+      - helm template --debug . -f staging-values.yaml
+      - helm template --debug . -f production-values.yaml
+
+  MyCustomKubectlCommands:
+    stage: release
+    title: Deployment to Staging
+    image: codefresh/kubectl
+    working_directory: '/codefresh/volume/codefresh-gitops/${{APP_NAME}}'
+    commands: 
+      - kubectl config get-contexts
+      - kubectl config use-context ${{KUBE_CONTEXT}}
+      - kubectl apply -f application.yaml
+
+  waitForInputBeforeProduction:
+    stage: release
+    title: Deploy to Production?
+    type: pending-approval
+    fail_fast: false
+    timeout:
+      duration: 2 # By default it is set to 168 (i.e, 7 days)
+      timeUnit: hours
+      finalState: denied
+    when:
+      branch:
+        only:
+          - master
+
+  MyCustomProdKubectlCommands:
+    stage: release
+    title: Promote to Production
+    image: codefresh/kubectl
+    working_directory: '/codefresh/volume/codefresh-gitops/${{APP_NAME}}'
+    commands: 
+      - kubectl config get-contexts
+      - kubectl config use-context ${{KUBE_CONTEXT_PROD}}
+      - kubectl apply -f application_prod.yaml
+    when:
+      steps:
+      - name: waitForInputBeforeProduction
+        on:
+        - approved
+
+# debug mode 11
