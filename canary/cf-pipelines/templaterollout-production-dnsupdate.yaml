@@ -27,7 +27,7 @@ steps:
   FetchSecrets:
     stage: prepare/builds
     title: Fetch secrets from AWS Secrets Manager
-    type: aws-secrets-manager
+    type: aws-secrets-manager:1.0.1
     arguments:
       AWS_ACCESS_KEY_ID: '${{AWS_ACCESS_KEY_ID}}'
       AWS_SECRET_ACCESS_KEY: '${{AWS_SECRET_ACCESS_KEY}}'
