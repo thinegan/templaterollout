@@ -1,0 +1,58 @@
+releaseStage: production
+
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values:
+          - t3.2xlarge
+          - t3.xlarge
+          - t3.large
+
+#############################################################################################################################
+ingress:
+  enabled: true
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/group.name: "shared-alb-group"
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/security-groups: "sg-xxxxxxx"
+    alb.ingress.kubernetes.io/listen-ports:  '[{"HTTP": 80}, {"HTTPS":443}]'
+    alb.ingress.kubernetes.io/group: templatebluegreen-ingress
+    alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:xxxxxx:xxxxxxxx:certificate/xxxxxxxx"
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS-1-2-Ext-2018-06
+    alb.ingress.kubernetes.io/backend-protocol: HTTP
+    alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+    alb.ingress.kubernetes.io/ssl-redirect: '443'
+    alb.ingress.kubernetes.io/healthcheck-path: "/"
+    alb.ingress.kubernetes.io/success-codes: "200"
+
+  labels:
+    app: "templatebluegreen"
+
+  hosts:
+    - host: templatebluegreen.crytera.com
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: "templatebluegreen"
+            port:
+              name: http
+    - host: templatebluegreen-preview.crytera.com
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: "templatebluegreen-preview"
+            port:
+              name: http
+
+  tls: []
+#############################################################################################################################
